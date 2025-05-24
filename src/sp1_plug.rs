@@ -7,6 +7,9 @@ use frostgate_sdk::zkplug::*;
 use serde::{Deserialize, Serialize};
 use sp1_sdk::SP1ProofWithPublicValues;
 use sp1_prover::SP1Prover as SP1ProverClient;
+use tokio::task;
+use async_trait::*;
+use std::fmt;
 use sp1_core_machine::io::SP1Stdin;
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,13 +35,7 @@ impl From<std::io::Error> for SP1PlugError {
         SP1PlugError::Io(e.to_string())
     }
 }
-impl From<ZkError> for SP1PlugError {
-    fn from(e: ZkError) -> Self {
-        SP1PlugError::ZkPlug(e)
-    }
-}
 
-#[derive(Debug)]
 pub struct SP1Plug {
     /// Path to guest ELF binary
     pub guest_program_path: String,
@@ -46,6 +43,16 @@ pub struct SP1Plug {
     program_cache: Mutex<Option<Vec<u8>>>,
     /// Underlying SP1 prover client
     prover_client: SP1ProverClient,
+}
+
+// Manual Debug implementation, skipping prover_client
+impl fmt::Debug for SP1Plug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SP1Plug")
+            .field("guest_program_path", &self.guest_program_path)
+            .field("program_cache", &"...") // or omit/cache info as needed
+            .finish()
+    }
 }
 
 impl SP1Plug {
@@ -107,19 +114,6 @@ impl SP1Plug {
     }
 }
 
-// For serialization
-impl Serialize for SP1ProofWithPublicValues {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.bytes())
-    }
-}
-impl<'de> Deserialize<'de> for SP1ProofWithPublicValues {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
-        SP1ProofWithPublicValues::from_bytes(&bytes).map_err(serde::de::Error::custom)
-    }
-}
-
 #[async_trait]
 impl ZkPlug for SP1Plug {
     type Proof = SP1ProofWithPublicValues;
@@ -140,8 +134,8 @@ impl ZkPlug for SP1Plug {
         let start = std::time::Instant::now();
 
         // If your sp1_prover is blocking, wrap in spawn_blocking
-        let proof = tokio::task::spawn_blocking({
-            let client = self.prover_client.clone();
+        let proof = task::spawn_blocking({
+            let client = self.prover_client;
             move || client.prove_core(&program, stdin)
         })
         .await
@@ -181,8 +175,8 @@ impl ZkPlug for SP1Plug {
 
         let start = std::time::Instant::now();
 
-        let proof = tokio::task::spawn_blocking({
-            let client = self.prover_client.clone();
+        let proof = task::spawn_blocking({
+            let client = self.prover_client;
             let program = program.to_vec();
             move || client.prove_core(&program, stdin)
         })
