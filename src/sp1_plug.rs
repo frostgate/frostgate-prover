@@ -7,6 +7,7 @@ use frostgate_sdk::zkplug::*;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use sp1_core_machine::io::SP1Stdin;
+use sp1_sdk::network::prover;
 use sp1_sdk::{
     NetworkProver, SP1ProofWithPublicValues, SP1ProvingKey, SP1VerifyingKey, ProverClient, EnvProver,
 };
@@ -15,12 +16,15 @@ use sp1_prover::SP1Prover;
 use sp1_prover::{SP1PlonkBn254Proof, SP1Groth16Bn254Proof};
 use sp1_prover::components::CpuProverComponents;
 use sp1_prover::SP1PublicValues;
-use std::path::Path;
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::panic;
+use std::collections::{HashMap, BTreeMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime};
 use tokio::sync::Semaphore;
-use std::fmt;
+use std::fmt::{self, format};
+use std::time::{SystemTime, Duration};
+
 
 /// SP1 proof types supported by this plug.
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +34,23 @@ pub enum Sp1ProofType {
     Groth16Bn254(SP1Groth16Bn254Proof),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    pub max_entries: Option<usize>,
+    pub ttl_seconds : Option<u64>,
+    pub enable_lru: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: Some(100), // Limit the cache size
+            ttl_seconds: Some(3600), // 1 hour TTL
+            enable_lru: true,
+        }
+    }
+}
+
 /// SP1 plug configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sp1PlugConfig {
@@ -37,6 +58,12 @@ pub struct Sp1PlugConfig {
     pub network_api_key: Option<String>,
     pub network_endpoint: Option<String>,
     pub max_concurrent: Option<usize>,
+    // Configurable build directory
+    pub build_dir: Option<PathBuf>,
+    // Configurable input size limt
+    pub max_input_size: Option<usize>,
+    // Cache configuration
+    pub cache_config: CacheConfig, 
 }
 
 impl Default for Sp1PlugConfig {
@@ -46,6 +73,9 @@ impl Default for Sp1PlugConfig {
             network_api_key: std::env::var("SP1_PRIVATE_KEY").ok(),
             network_endpoint: None,
             max_concurrent: Some(num_cpus::get()),
+            build_dir: Some(std::env::curent_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            max_input_size: Some(100*1024*1024), // 100MB default
+            cache_config: CacheConfig::default(),
         }
     }
 }
@@ -58,6 +88,98 @@ struct ProgramInfo {
     verifying_key: SP1VerifyingKey,
     program_hash: String,
     compiled_at: SystemTime,
+    last_accessed: SystemTime,
+    access_count: u64,
+}
+
+#[derive(Debug)]
+struct ProgramCache {
+    entries: HashMap<String, ProgramInfo>,
+    access_order: BTreeMap<SystemTime, String>, // For LRU tracking
+    config: CacheConfig,
+}
+
+impl ProgramCache {
+    fn new(config: CacheConfig) -> Self {
+        Self {
+            entries: HashMap::new(), 
+            access_order: BTreeMap::new(),
+            config,
+        }
+    }
+
+    fn get(&mut self, hash: &str) -> Option<ProgramInfo> {
+        if let Some(mut info) = self.entries.get(hash).cloned() {
+            // Check TTL
+            if let Some(ttl) = self.config.ttl_seconds {
+                let age = SystemTime::now()
+                    .duration_since(info.compiled_at)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_secs();
+                
+                if age > ttl {
+                    self.remove(hash);
+                    return None;
+                }
+            }
+
+            // Update access tracking
+            if self.config.enable_lru {
+                self.access_order.remove(&info.last_accessed);
+                info.last_accessed = SystemTime::now();
+                info.access_count += 1;
+                self.access_order.insert(info.last_accessed, hash.to_string());
+                self.entries.insert(hash.to_string(), info.clone());
+            }
+
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, hash: String, mut info: ProgramInfo) {
+        // Evict if necessary
+        if let Some(max_entries) = self.config.max_entries {
+            while self.entries.len() >= max_entries {
+                self.evict_oldest();
+            }
+        }
+
+        info.last_accessed = SystemTime::now();
+        if self.config.enable_lru {
+            self.access_order.insert(info.last_accessed, hash.clone());
+        }
+        self.entries.insert(hash, info);
+    }
+
+    fn remove(&mut self, hash: &str) {
+        if let Some(info) = self.entries.remove(hash) {
+            if self.config.enable_lru {
+                self.access_order.remove(&info.last_accessed);
+            }
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        if self.config.enable_lru && !self.access_order.is_empty() {
+            if let Some((_, oldest_hash)) = self.access_order.iter().next() {
+                let oldest_hash = oldest_hash.clone();
+                self.remove(&oldest_hash);
+            }
+        } else if let Some(hash) = self.entries.keys().next().cloned() {
+            self.remove(&hash);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clea();
+        self.access_order.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl fmt::Debug for ProgramInfo {
@@ -89,7 +211,7 @@ impl fmt::Debug for Sp1Backend {
 pub struct Sp1Plug {
     backend: Sp1Backend,
     config: Sp1PlugConfig,
-    programs: RwLock<HashMap<String, ProgramInfo>>,
+    programs: RwLock<ProgramCache>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -154,16 +276,63 @@ impl Sp1Plug {
         Self {
             backend,
             config,
-            programs: RwLock::new(HashMap::new()),
+            programs: RwLock::new(ProramCache::new(config.cache_config)),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+        }
+    }
+
+    async fn verify_proof_unified(
+        &self,
+        proof_type: &Sp1ProofType,
+        verifying_key: &SP1VerifyingKey,
+        build_dir: &Path,
+    ) -> Result<bool, Sp1PlugError> {
+        match proof_type {
+            Sp1ProofType::Core(core_proof) => {
+                match &self.backend {
+                    Sp1Backend::Local(prover) => {
+                        prover.verify(core_proof, verifying_key)
+                            .map_err(|e| Sp1PlugError::Verify(format!("Core verification failed: {:?}", e)))
+                    }
+                    Sp1Backend::Network(prover) => {
+                        prover.verify(core_proof, verifying_key)
+                            .map_err(|e| Sp1PlugError::Verify(format!("Core verification failed: {:?}", e)))
+                    }
+                }
+            }
+
+            Sp1ProofType::PlonkBn254(plonk_proof) => {
+                let local_prover = SP1Prover::<CpuProverComponents>::new();
+                local_prover.verify_plonk_bn254(
+                    &plonk_proof.0,
+                    verifying_key,
+                    &plonk_proof.public_values,
+                    build_dir,
+                )
+                .map_err(|e| Sp1PlugError::Verify(format!("Plonk verification failed: {:?}", e)))
+            }
+            Sp1ProofType::Groth16Bn254(groth_proof) => {
+                let local_prover = SP1Prover::<CpuProverComponents>::new();
+                local_prover.verify_groth16_bn254(
+                    &groth_proof.proof.0,
+                    verifying_key,
+                    &groth_proof.public_values,
+                    build_dir,
+                )
+                .map_err(|e| Sp1PlugError::Verify(format!("Groth16 verification failed: {:?}", e)))
+            }
         }
     }
 
     /// Setup program keys and cache them by hash
     async fn setup_program(&self, elf: &[u8]) -> Result<String, Sp1PlugError> {
         let program_hash = hex::encode(Keccak256::digest(elf));
-        if self.programs.read().unwrap().contains_key(&program_hash) {
-            return Ok(program_hash);
+        
+        // Check cache first
+        if self.programs.read().unwrap().len() > 0 {
+            if let Some(_) = self.programs.write().unwrap().get(&program_hash) {
+                return Ok(program_hash);
+            }
         }
         
         let (proving_key, verifying_key) = match &self.backend {
@@ -177,6 +346,8 @@ impl Sp1Plug {
             verifying_key,
             program_hash: program_hash.clone(),
             compiled_at: SystemTime::now(),
+            last_accessed: SystemTime::now(),
+            access_count: 0,
         };
         
         self.programs
@@ -188,12 +359,19 @@ impl Sp1Plug {
 
     fn get_program_info(&self, hash: &str) -> Result<ProgramInfo, Sp1PlugError> {
         self.programs
-            .read()
+            .write()
             .unwrap()
             .get(hash)
             .cloned()
             .ok_or_else(|| Sp1PlugError::NotFound("Program not found".to_string()))
     }
+
+    fn get_build_dir(&self) -> &Path {
+        self.config.build_dir
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."))
+    }
+
 }
 
 #[async_trait]
@@ -264,41 +442,9 @@ impl ZkPlug for Sp1Plug {
             .ok_or_else(|| Sp1PlugError::Input("Missing program hash".to_string()))?;
         let info = self.get_program_info(program_hash)?;
 
-        match &proof.proof {
-            Sp1ProofType::Core(core) => match &self.backend {
-                Sp1Backend::Local(prover) => {
-                    prover.verify(core, &info.verifying_key)
-                        .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-                }
-                Sp1Backend::Network(prover) => {
-                    prover.verify(core, &info.verifying_key)
-                        .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-                }
-            },
-            Sp1ProofType::PlonkBn254(plonk_with_meta) => {
-                let build_dir = Path::new(".");
-                let prover = SP1Prover::<CpuProverComponents>::new();
-                prover.verify_plonk_bn254(
-                    &plonk_with_meta.proof.0,
-                    &info.verifying_key,
-                    &plonk_with_meta.public_values,
-                    build_dir,
-                )
-                .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-            },
-            Sp1ProofType::Groth16Bn254(groth_with_meta) => {
-                let build_dir = Path::new(".");
-                let prover = SP1Prover::<CpuProverComponents>::new();
-                prover.verify_groth16_bn254(
-                    &groth_with_meta.proof.0,
-                    &info.verifying_key,
-                    &groth_with_meta.public_values,
-                    build_dir,
-                )
-                .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-            },
-        }
-        Ok(true)
+        // Use unified verification method with configurable build directory
+        let build_dir = self.get_build_dir();
+        self.verify_proof_unified(&proof.proof, &info.verifying_key, build_dir).await
     }
 
     async fn execute(
@@ -381,16 +527,38 @@ impl ZkPlug for Sp1Plug {
     }
 
     async fn health_check(&self) -> HealthStatus {
-        HealthStatus::Healthy
+        // Try to perform a minimal operation to check backend health
+        match &self.backend {
+            Sp1Backend::Local(_) => {
+                // For local backend, check if we can create a prover
+                match std::panic::catch_unwind(|| SP1Prover::<CpuProverComponents>::new()) {
+                    Ok(_) => HealthStatus::Healthy,
+                    Err(_) => HealthStatus::Degraded,
+                }
+            }
+            Sp1Backend::Network(_) => {
+                // For network backend, this would require an actual ping/health endpoint
+                // For now, assume healthy if we have configuration
+                if self.config.network_api_key.is_some() {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Unhealthy
+                }
+            }
+        }
     }
 
     async fn get_resource_usage(&self) -> ResourceUsage {
+        let cache_len = self.programs.read().unwrap().len();
+        let available_permits = self.semaphore.available_permits();
+        let max_concurrent = self.config.max_concurrent.unwrap_or_else(num_cpus::get);
+        
         ResourceUsage {
-            cpu_usage: 0.0,
-            memory_usage: 0,
-            available_memory: 8 * 1024 * 1024 * 1024,
-            active_tasks: 0,
-            queue_depth: 0,
+            cpu_usage: 0.0, // Would need system metrics crate for actual CPU usage
+            memory_usage: cache_len * 1024 * 1024, // Rough estimate
+            available_memory: 8 * 1024 * 1024 * 1024, // Would need system info
+            active_tasks: max_concurrent - available_permits,
+            queue_depth: 0, // Would need to track pending operations
         }
     }
 
