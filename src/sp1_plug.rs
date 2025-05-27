@@ -1,3 +1,5 @@
+// frostgate-prover/src/sp1_plug.rs
+
 #![allow(unused_imports)]
 
 use async_trait::async_trait;
@@ -6,9 +8,14 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use sp1_core_machine::io::SP1Stdin;
 use sp1_sdk::{
-    NetworkProver, SP1Proof, SP1ProvingKey, SP1VerifyingKey, ProverClient, EnvProver,
+    NetworkProver, SP1ProofWithPublicValues, SP1ProvingKey, SP1VerifyingKey, ProverClient, EnvProver,
 };
+use sp1_sdk::Prover;
+use sp1_prover::SP1Prover;
 use sp1_prover::{SP1PlonkBn254Proof, SP1Groth16Bn254Proof};
+use sp1_prover::components::CpuProverComponents;
+use sp1_prover::SP1PublicValues;
+use std::path::Path;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime};
@@ -16,9 +23,9 @@ use tokio::sync::Semaphore;
 use std::fmt;
 
 /// SP1 proof types supported by this plug.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Sp1ProofType {
-    Core(SP1Proof),
+    Core(SP1ProofWithPublicValues),
     PlonkBn254(SP1PlonkBn254Proof),
     Groth16Bn254(SP1Groth16Bn254Proof),
 }
@@ -43,7 +50,8 @@ impl Default for Sp1PlugConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Cached program information including compiled keys
+#[derive(Clone)]
 struct ProgramInfo {
     elf: Vec<u8>,
     proving_key: SP1ProvingKey,
@@ -52,7 +60,18 @@ struct ProgramInfo {
     compiled_at: SystemTime,
 }
 
-/// A wrapper so we can store either a local or remote prover.
+impl fmt::Debug for ProgramInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgramInfo")
+            .field("program_hash", &self.program_hash)
+            .field("compiled_at", &self.compiled_at)
+            .field("proving_key", &"<SP1ProvingKey omitted>")
+            .field("verifying_key", &"<SP1VerifyingKey omitted>")
+            .finish()
+    }
+}
+
+/// Backend wrapper for local or network proving
 enum Sp1Backend {
     Local(EnvProver),
     Network(NetworkProver),
@@ -67,7 +86,6 @@ impl fmt::Debug for Sp1Backend {
     }
 }
 
-// Do NOT derive Debug for Sp1Plug!
 pub struct Sp1Plug {
     backend: Sp1Backend,
     config: Sp1PlugConfig,
@@ -84,7 +102,6 @@ impl fmt::Debug for Sp1Plug {
     }
 }
 
-// Add Sp1PlugError definition
 #[derive(Debug, thiserror::Error)]
 pub enum Sp1PlugError {
     #[error("SP1 key generation error: {0}")]
@@ -131,7 +148,7 @@ impl Sp1Plug {
                 .unwrap_or("https://api.sp1.giza.io");
             Sp1Backend::Network(NetworkProver::new(api_key, endpoint))
         } else {
-            Sp1Backend::Local(EnvProver::from_env())
+            Sp1Backend::Local(EnvProver::new())
         };
         let max_concurrent = config.max_concurrent.unwrap_or_else(num_cpus::get);
         Self {
@@ -142,17 +159,18 @@ impl Sp1Plug {
         }
     }
 
+    /// Setup program keys and cache them by hash
     async fn setup_program(&self, elf: &[u8]) -> Result<String, Sp1PlugError> {
         let program_hash = hex::encode(Keccak256::digest(elf));
         if self.programs.read().unwrap().contains_key(&program_hash) {
             return Ok(program_hash);
         }
-        // Use backend's setup
+        
         let (proving_key, verifying_key) = match &self.backend {
             Sp1Backend::Local(prover) => prover.setup(elf),
-            Sp1Backend::Network(prover) => prover.setup(elf).run()
-                .map_err(|e| Sp1PlugError::KeyGen(format!("{:?}", e)))?,
+            Sp1Backend::Network(prover) => prover.setup(elf),
         };
+        
         let info = ProgramInfo {
             elf: elf.to_vec(),
             proving_key,
@@ -160,6 +178,7 @@ impl Sp1Plug {
             program_hash: program_hash.clone(),
             compiled_at: SystemTime::now(),
         };
+        
         self.programs
             .write()
             .unwrap()
@@ -201,10 +220,10 @@ impl ZkPlug for Sp1Plug {
         let _permit = self.semaphore.acquire().await.unwrap();
         let start = Instant::now();
 
-        // Use backend's prove
         let proof = match &self.backend {
             Sp1Backend::Local(prover) => {
                 prover.prove(&info.proving_key, &stdin)
+                    .run()
                     .map_err(|e| Sp1PlugError::Proof(format!("{:?}", e)))?
             }
             Sp1Backend::Network(prover) => {
@@ -253,31 +272,30 @@ impl ZkPlug for Sp1Plug {
                 }
                 Sp1Backend::Network(prover) => {
                     prover.verify(core, &info.verifying_key)
-                        .run()
                         .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
                 }
             },
-            Sp1ProofType::PlonkBn254(plonk) => match &self.backend {
-                Sp1Backend::Local(prover) => {
-                    prover.verify_plonk_bn254(plonk, &info.verifying_key)
-                        .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-                }
-                Sp1Backend::Network(prover) => {
-                    prover.verify_plonk_bn254(plonk, &info.verifying_key)
-                        .run()
-                        .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-                }
+            Sp1ProofType::PlonkBn254(plonk_with_meta) => {
+                let build_dir = Path::new(".");
+                let prover = SP1Prover::<CpuProverComponents>::new();
+                prover.verify_plonk_bn254(
+                    &plonk_with_meta.proof.0,
+                    &info.verifying_key,
+                    &plonk_with_meta.public_values,
+                    build_dir,
+                )
+                .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
             },
-            Sp1ProofType::Groth16Bn254(groth) => match &self.backend {
-                Sp1Backend::Local(prover) => {
-                    prover.verify_groth16_bn254(groth, &info.verifying_key)
-                        .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-                }
-                Sp1Backend::Network(prover) => {
-                    prover.verify_groth16_bn254(groth, &info.verifying_key)
-                        .run()
-                        .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
-                }
+            Sp1ProofType::Groth16Bn254(groth_with_meta) => {
+                let build_dir = Path::new(".");
+                let prover = SP1Prover::<CpuProverComponents>::new();
+                prover.verify_groth16_bn254(
+                    &groth_with_meta.proof.0,
+                    &info.verifying_key,
+                    &groth_with_meta.public_values,
+                    build_dir,
+                )
+                .map_err(|e| Sp1PlugError::Verify(format!("{:?}", e)))?
             },
         }
         Ok(true)
@@ -303,9 +321,10 @@ impl ZkPlug for Sp1Plug {
 
         let (output, report) = match &self.backend {
             Sp1Backend::Local(prover) => {
-                prover.execute(&info.elf, &stdin)
-                    .map_err(|e| Sp1PlugError::Execution(format!("{:?}", e)))?
-            }
+            prover.execute(&info.elf, &stdin)
+                .run()
+                .map_err(|e| Sp1PlugError::Execution(format!("{:?}", e)))?
+        }
             Sp1Backend::Network(prover) => {
                 prover.execute(&info.elf, &stdin)
                     .run()
@@ -324,8 +343,11 @@ impl ZkPlug for Sp1Plug {
 
         let proof = self.prove(program, public_inputs, None).await?;
 
+        let output_bytes = bincode::serialize(&output)
+            .map_err(|e| Sp1PlugError::Execution(format!("Serialization error: {:?}", e)))?;
+
         Ok(ExecutionResult {
-            output,
+            output: output_bytes,
             proof,
             stats,
         })
