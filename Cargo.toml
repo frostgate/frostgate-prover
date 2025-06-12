@@ -12,9 +12,9 @@ frostgate-sdk = { path = "../frostgate-sdk" }
 uuid = { workspace = true }
 bincode.workspace = true
 tracing = "0.1.41"
-sp1-prover = "4.2.1"
-sp1-sdk = { version = "4.2.1", features = ["network"] }
-sp1-core-machine = "4.2.1"
+sp1-prover = "5.0.0"
+sp1-sdk = { version = "5.0.0", features = ["network"] }
+sp1-core-machine = "5.0.0"
 tokio.workspace = true
 async-trait.workspace = true
 sha3 = "0.10.8"
